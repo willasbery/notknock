@@ -52,6 +52,109 @@ class ExternalEventPayload(BaseModel):
     detection_time: float = Field(..., description="Timestamp of the primary detection event")
     frames_data: List[ExternalFrameData] = Field(..., min_items=1)
 
+# --- WebSocket Connection Management for VIEWERS ---
+# Maps camera_id -> list of viewer WebSockets interested in that camera
+viewer_connections: Dict[str, List[WebSocket]] = collections.defaultdict(list)
+# Stores the latest frame received from external cameras (bytes)
+latest_external_frames: Dict[str, bytes] = {}
+# Lock for safely accessing shared viewer_connections dict from multiple tasks
+viewer_lock = asyncio.Lock()
+
+# --- Notification Management ---
+# NOTIFICATIONS
+notification_clients: List[WebSocket] = []
+notification_lock = asyncio.Lock()
+# QUEUE for notifications from recorder thread to broadcast task
+notification_queue: asyncio.Queue = asyncio.Queue()
+
+async def add_viewer(camera_id: str, websocket: WebSocket):
+    """Adds a viewer WebSocket to the list for a given camera_id."""
+    async with viewer_lock:
+        viewer_connections[camera_id].append(websocket)
+    logger.info(f"Viewer connected for camera: {camera_id}. Total: {len(viewer_connections[camera_id])}")
+
+async def remove_viewer(camera_id: str, websocket: WebSocket):
+    """Removes a viewer WebSocket from the list."""
+    async with viewer_lock:
+        if camera_id in viewer_connections:
+            try:
+                viewer_connections[camera_id].remove(websocket)
+                if not viewer_connections[camera_id]: # Remove camera_id if list is empty
+                    del viewer_connections[camera_id]
+                logger.info(f"Viewer disconnected for camera: {camera_id}. Remaining: {len(viewer_connections.get(camera_id, []))}")
+            except ValueError:
+                pass # Ignore if websocket not found (already removed)
+
+async def broadcast_frame_to_viewers(camera_id: str, frame_data: Any, data_type: str):
+    """Sends frame data (bytes or text) to all viewers of a camera."""
+    disconnected_viewers = []
+    async with viewer_lock: # Ensure exclusive access while iterating/sending
+        if camera_id in viewer_connections:
+            viewers = viewer_connections[camera_id]
+            # logger.debug(f"Broadcasting frame for {camera_id} to {len(viewers)} viewers.")
+            for viewer_ws in viewers:
+                try:
+                    if viewer_ws.client_state == WebSocketState.CONNECTED:
+                        if data_type == "text":
+                            await viewer_ws.send_text(frame_data)
+                        elif data_type == "bytes":
+                            await viewer_ws.send_bytes(frame_data)
+                    else:
+                        disconnected_viewers.append(viewer_ws)
+                except Exception: # Handle potential errors during send
+                    disconnected_viewers.append(viewer_ws)
+
+    # Remove viewers that failed or were disconnected outside the lock
+    if disconnected_viewers:
+         logger.warning(f"Found {len(disconnected_viewers)} disconnected viewers for {camera_id} during broadcast.")
+         # Removing them requires the lock again, or do it separately
+         # For simplicity, let the disconnect handler manage removal.
+
+# --- Notification Helpers ---
+async def add_notification_client(websocket: WebSocket):
+    """Adds a WebSocket client to the notification list."""
+    async with notification_lock:
+        notification_clients.append(websocket)
+    logger.info(f"Notification client connected. Total: {len(notification_clients)}")
+
+async def remove_notification_client(websocket: WebSocket):
+    """Removes a WebSocket client from the notification list."""
+    async with notification_lock:
+        try:
+            notification_clients.remove(websocket)
+            logger.info(f"Notification client disconnected. Remaining: {len(notification_clients)}")
+        except ValueError:
+            pass # Already removed
+
+async def broadcast_notification(payload: Dict[str, Any]):
+    """Sends a notification payload (dict) as JSON to all connected notification clients."""
+    disconnected_clients = []
+    # Ensure payload is JSON serializable before broadcasting
+    try:
+        message_json = json.dumps(payload)
+    except TypeError:
+        logger.error(f"Failed to serialize notification payload: {payload}")
+        return
+
+    async with notification_lock:
+        logger.info(f"Broadcasting notification to {len(notification_clients)} clients: {message_json}")
+        for client_ws in notification_clients:
+            try:
+                if client_ws.client_state == WebSocketState.CONNECTED:
+                    await client_ws.send_text(message_json) # Send as JSON string
+                else:
+                    disconnected_clients.append(client_ws)
+            except Exception:
+                disconnected_clients.append(client_ws)
+
+    # Optional: Remove disconnected clients here if needed, requires lock again
+    # if disconnected_clients:
+    #    async with notification_lock:
+    #        for client in disconnected_clients:
+    #            try: notification_clients.remove(client)
+    #            except ValueError: pass
+
+
 # --- Shared Recorder Function ---
 def record_event_from_data(
     camera_id: str,
@@ -145,6 +248,7 @@ def record_event_from_data(
 
     # --- Write Video File (using the new video_path) ---
     video_writer = None
+    video_success = False
     try:
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
         video_writer = cv2.VideoWriter(str(video_path), fourcc, target_fps, (width, height))
@@ -153,6 +257,7 @@ def record_event_from_data(
             return
         for frame, _, _ in frames_data: video_writer.write(frame)
         logger.debug(f"[{camera_id}] Video writing complete for {video_path.name}")
+        video_success = True
 
     except Exception as e:
         logger.exception(f"[{camera_id}] Error writing video file {video_path}: {e}")
@@ -166,64 +271,61 @@ def record_event_from_data(
         if video_writer: video_writer.release()
 
     # --- Write JSON Metadata File (using the new json_path) ---
-    try:
-        with open(json_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        logger.info(f"[{camera_id}] Successfully recorded event: {video_path.name}, {json_path.name}")
-    except Exception as e:
-        logger.exception(f"[{camera_id}] Error writing JSON metadata file {json_path}: {e}")
+    json_success = False
+    if video_success:
+        try:
+            with open(json_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            logger.info(f"[{camera_id}] Successfully recorded event: {video_path.name}, {json_path.name}")
+            json_success = True
+        except Exception as e:
+            logger.exception(f"[{camera_id}] Error writing JSON metadata file {json_path}: {e}")
 
+    # --- Edit 1: Send Notification Payload to Queue ---
+    if video_success and json_success:
+        try:
+            # Construct the full URL for the video file
+            relative_video_path = f"{camera_id}/{video_path.name}"
+            static_path_prefix = "static/events/"
+            full_video_url = f"{SERVER_BASE_URL.rstrip('/')}/{static_path_prefix}{relative_video_path}"
 
-# --- WebSocket Connection Management for VIEWERS ---
-# Maps camera_id -> list of viewer WebSockets interested in that camera
-viewer_connections: Dict[str, List[WebSocket]] = collections.defaultdict(list)
-# Stores the latest frame received from external cameras (bytes)
-latest_external_frames: Dict[str, bytes] = {}
-# Lock for safely accessing shared viewer_connections dict from multiple tasks
-viewer_lock = asyncio.Lock()
+            # Prepare notification payload
+            detected_labels = metadata.get("recording_info", {}).get("summary_detected_labels", ["object"])
+            message = f"Event detected on {camera_id} ({', '.join(detected_labels)})."
 
-async def add_viewer(camera_id: str, websocket: WebSocket):
-    """Adds a viewer WebSocket to the list for a given camera_id."""
-    async with viewer_lock:
-        viewer_connections[camera_id].append(websocket)
-    logger.info(f"Viewer connected for camera: {camera_id}. Total viewers: {len(viewer_connections[camera_id])}")
+            notification_payload = {
+                "type": "event_notification",
+                "camera_id": camera_id,
+                "message": message,
+                "video_url": full_video_url,
+                "timestamp": time.time(), # Notification generation time
+                "detection_time": detection_time,
+                "metadata_file": metadata.get("recording_info", {}).get("metadata_file"),
+                 # Add other relevant info from metadata if needed
+                "summary_labels": detected_labels
+            }
 
-async def remove_viewer(camera_id: str, websocket: WebSocket):
-    """Removes a viewer WebSocket from the list."""
-    async with viewer_lock:
-        if camera_id in viewer_connections:
-            try:
-                viewer_connections[camera_id].remove(websocket)
-                if not viewer_connections[camera_id]: # Remove camera_id if list is empty
-                    del viewer_connections[camera_id]
-                logger.info(f"Viewer disconnected for camera: {camera_id}. Remaining: {len(viewer_connections.get(camera_id, []))}")
-            except ValueError:
-                pass # Ignore if websocket not found (already removed)
+            # Put the payload onto the async queue (safe from thread)
+            notification_queue.put_nowait(notification_payload)
 
-async def broadcast_frame_to_viewers(camera_id: str, frame_data: Any, data_type: str):
-    """Sends frame data (bytes or text) to all viewers of a camera."""
-    disconnected_viewers = []
-    async with viewer_lock: # Ensure exclusive access while iterating/sending
-        if camera_id in viewer_connections:
-            viewers = viewer_connections[camera_id]
-            # logger.debug(f"Broadcasting frame for {camera_id} to {len(viewers)} viewers.")
-            for viewer_ws in viewers:
-                try:
-                    if viewer_ws.client_state == WebSocketState.CONNECTED:
-                        if data_type == "text":
-                            await viewer_ws.send_text(frame_data)
-                        elif data_type == "bytes":
-                            await viewer_ws.send_bytes(frame_data)
-                    else:
-                        disconnected_viewers.append(viewer_ws)
-                except Exception: # Handle potential errors during send
-                    disconnected_viewers.append(viewer_ws)
+        except Exception as e:
+            logger.error(f"[{camera_id}] Failed to prepare or queue notification for event {video_path.name}: {e}")
 
-    # Remove viewers that failed or were disconnected outside the lock
-    if disconnected_viewers:
-         logger.warning(f"Found {len(disconnected_viewers)} disconnected viewers for {camera_id} during broadcast.")
-         # Removing them requires the lock again, or do it separately
-         # For simplicity, let the disconnect handler manage removal.
+    elif video_success and not json_success:
+         # Optional: Notify about video success but metadata failure
+         try:
+              failure_payload = {
+                   "type": "event_warning",
+                   "camera_id": camera_id,
+                   "message": f"Event video saved for {camera_id}, but metadata write failed.",
+                   "video_url": None, # Or maybe still provide video URL?
+                   "timestamp": time.time(),
+                   "detection_time": detection_time,
+              }
+              notification_queue.put_nowait(failure_payload)
+         except Exception as e:
+             logger.error(f"[{camera_id}] Failed to queue warning notification: {e}")
+    # --- End Edit ---
 
 
 # --- FastAPI Setup ---
@@ -249,6 +351,10 @@ async def lifespan(app: FastAPI):
     # --- Start Background Task for Local Camera Broadcasting ---
     app.state.local_broadcast_task = asyncio.create_task(broadcast_local_camera_frames(app.state.camera_manager))
     logger.info("Local camera frame broadcasting task started.")
+
+    # --- Edit 2: Start Notification Processing Task ---
+    app.state.notification_task = asyncio.create_task(process_notifications())
+    logger.info("Notification processing task started.")
 
     yield
 
@@ -283,6 +389,22 @@ async def lifespan(app: FastAPI):
          viewer_connections.clear()
     logger.info("Viewer WebSocket connections cleared.")
 
+    # --- Edit 3: Stop Notification Processing Task ---
+    if app.state.notification_task:
+         app.state.notification_task.cancel()
+         try: await app.state.notification_task
+         except asyncio.CancelledError: logger.info("Notification processing task cancelled.")
+         except Exception as e: logger.error(f"Error during notification task shutdown: {e}")
+
+    # Clean up notification clients
+    async with notification_lock:
+        for ws in list(notification_clients):
+            if ws.client_state != WebSocketState.DISCONNECTED:
+                try: await ws.close(code=1001)
+                except Exception: pass
+        notification_clients.clear()
+    logger.info("Notification WebSocket clients cleared.")
+
 async def broadcast_local_camera_frames(manager: CameraManager):
     """Task to broadcast frames from the local camera queue to viewers."""
     local_cam_id = manager.local_camera_id # Get ID from manager
@@ -301,6 +423,20 @@ async def broadcast_local_camera_frames(manager: CameraManager):
         except Exception as e:
              logger.error(f"Error in local broadcast loop: {e}")
              await asyncio.sleep(1) # Longer sleep on error
+
+async def process_notifications():
+    """Task to read notifications from the queue and broadcast them."""
+    while True:
+        try:
+            payload = await notification_queue.get()
+            await broadcast_notification(payload)
+            notification_queue.task_done()
+        except asyncio.CancelledError:
+             logger.info("Notification processing task stopping.")
+             break
+        except Exception as e:
+             logger.error(f"Error processing notification queue: {e}")
+             await asyncio.sleep(1) # Avoid rapid error loops
 
 
 app = FastAPI(lifespan=lifespan)
@@ -649,6 +785,30 @@ async def websocket_send_to_viewer(websocket: WebSocket, camera_id: str):
     finally:
         # Remove viewer from connection list
         await remove_viewer(camera_id, websocket)
+
+
+# --- NEW WebSocket Endpoint for NOTIFICATION Clients ---
+@app.websocket("/ws/notifications")
+async def websocket_endpoint_notifications(websocket: WebSocket):
+    """WebSocket endpoint for clients (e.g., frontend) to receive notifications."""
+    await websocket.accept()
+    await add_notification_client(websocket)
+    try:
+        # Keep the connection open and listen for potential messages (e.g., pings)
+        while True:
+            # You might not need to receive anything, just keepalive
+            # Or handle client pings
+            data = await websocket.receive_text()
+            if data == "ping":
+                 await websocket.send_text("pong")
+            # Ignore other messages for now
+    except WebSocketDisconnect:
+        logger.info("Notification client disconnected.")
+    except Exception as e:
+        # Log errors but don't necessarily crash the server endpoint
+        logger.error(f"WebSocket error (notification client): {e}")
+    finally:
+        await remove_notification_client(websocket)
 
 
 if __name__ == "__main__":
