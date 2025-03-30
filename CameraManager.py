@@ -6,10 +6,11 @@ import datetime
 import numpy as np
 from pathlib import Path
 import collections
-from typing import Set, Optional, Deque, List, Tuple
+from typing import Set, Optional, Deque, List, Tuple, Dict
 import threading
 import queue
 import logging
+import json
 from modlib.apps import Annotator
 from modlib.devices import AiCamera
 from modlib.models.zoo import SSDMobileNetV2FPNLite320x320
@@ -31,6 +32,11 @@ RECORDING_DELAY = 15.0  # Delay before starting the recording job
 BUFFER_DURATION = RECORDING_WINDOW_BEFORE + RECORDING_WINDOW_AFTER + 5.0 # Keep a bit extra buffer
 RECORDING_COOLDOWN = 2.0 # Minimum seconds between triggering recordings
 LONG_PRESENCE_THRESHOLD = 15.0 # Seconds of continuous presence to override cooldown
+
+# --- Add Type Alias ---
+# Define a type hint for detection data stored in the buffer
+# Assuming format: (confidence, class_id, bbox_tuple)
+DetectionInfo = Tuple[float, int, Tuple[int, int, int, int]]
 
 class CameraManager:
     """
@@ -54,7 +60,7 @@ class CameraManager:
         # Frame history settings
         # Estimate required buffer size based on expected FPS and buffer duration
         # Assuming an average FPS of 20-30. A buffer size of ~1000 should cover > 30 seconds.
-        self.frame_history: Deque[Tuple[np.ndarray, float]] = collections.deque(maxlen=1000) 
+        self.frame_history: Deque[Tuple[np.ndarray, float, List[DetectionInfo]]] = collections.deque(maxlen=1000) 
 
         # Video settings
         self.target_fps = 25.0 # Target FPS for recorded video
@@ -119,9 +125,8 @@ class CameraManager:
 
     def _process_frames_thread(self):
         """
-        Processes frames from the camera in a non-blocking thread.
-        Stores *annotated* frames, performs detection, schedules recording jobs,
-        and prepares frames for streaming.
+        Processes frames, performs detection, annotates, stores frame+timestamp+detections,
+        triggers recording, and prepares frames for streaming.
         """
         logger.info("Frame processing thread started")
         last_log_time = 0
@@ -135,9 +140,7 @@ class CameraManager:
 
                     try:
                         current_time = time.time()
-                        # Get the frame image *before* annotation for potential clean storage if needed later
-                        # but we will annotate before storing for this request.
-                        frame_image = frame_obj.image
+                        frame_image = frame_obj.image # Get the raw image
 
                         # Log buffer stats occasionally (can be done before detection)
                         if current_time - last_log_time > 60: # Log every minute
@@ -146,28 +149,34 @@ class CameraManager:
                             last_log_time = current_time
 
                         # --- Detection ---
-                        detections = frame_obj.detections[frame_obj.detections.confidence > 0.55]
+                        # Get the filtered Detections object
+                        filtered_detections_obj = frame_obj.detections[frame_obj.detections.confidence > 0.55]
+
+                        # --- Edit 2: Convert detections for storage ---
+                        current_detections_list: List[DetectionInfo] = [
+                            (float(score), int(class_id), tuple(map(int, bbox)))
+                            for bbox, score, class_id, _ in filtered_detections_obj
+                        ]
 
                         # --- Annotation ---
-                        # Prepare labels for annotation
-                        labels = [f"{self.model.labels[class_id]}: {score:0.2f}"
-                                  for _, score, class_id, _ in detections]
-                        # Annotate the frame IN PLACE (modifies frame_obj.image)
-                        self.annotator.annotate_boxes(frame_obj, detections, labels=labels)
+                        # Prepare labels based on the filtered detections
+                        labels = [f"{self.model.labels[class_id]}: {score:.2f}"
+                                  for _, score, class_id, _ in filtered_detections_obj]
+                        # Annotate the frame IN PLACE (modifies frame_obj.image, which is frame_image)
+                        self.annotator.annotate_boxes(frame_obj, filtered_detections_obj, labels=labels)
 
-                        # --- Store Annotated Frame ---
-                        # Now frame_image (which is frame_obj.image) is annotated
-                        # Make a copy before storing to avoid issues if frame_obj is reused/modified further
+                        # --- Edit 3: Store Annotated Frame and Detections ---
+                        # Now frame_image (which is frame_obj.image) is annotated.
+                        # Make a copy before storing.
                         annotated_frame_copy = frame_image.copy()
-                        self.frame_history.append((annotated_frame_copy, current_time))
+                        # Store the annotated frame, timestamp, and the detection list
+                        self.frame_history.append((annotated_frame_copy, current_time, current_detections_list))
 
                         # --- Person Detection & Recording Trigger ---
-                        person_currently_detected = False
-                        # Reuse detections from earlier
-                        for _, score, class_id, _ in detections:
-                            if self.model.labels[class_id] == 'person' and score > 0.6:
-                                person_currently_detected = True
-                                break
+                        person_currently_detected = any(
+                            self.model.labels[class_id] == 'person' and score > 0.6
+                            for score, class_id, _ in current_detections_list # Use the list we created
+                        )
 
                         # --- Update Continuous Detection State & Trigger Logic ---
                         # ... (This logic remains the same as the previous version) ...
@@ -206,7 +215,7 @@ class CameraManager:
                             # Pass the shape of the annotated frame
                             if self.loop:
                                 asyncio.run_coroutine_threadsafe(
-                                    self._schedule_recording(current_time, annotated_frame_copy.shape),
+                                    self._schedule_recording(current_time, annotated_frame_copy.shape), # Pass shape from the copy
                                     self.loop
                                 )
                             else:
@@ -215,8 +224,8 @@ class CameraManager:
                              logger.debug(f"Person detected at {current_time:.2f}, but within cooldown and below long presence threshold. Ignoring trigger.")
 
                         # --- Frame Encoding for Streaming ---
-                        # Encode the *already annotated* frame for streaming
-                        _, buffer = cv2.imencode('.jpg', frame_image) # frame_image is already annotated
+                        # Encode the *already annotated* frame (frame_image) for streaming
+                        _, buffer = cv2.imencode('.jpg', frame_image)
                         encoded_image = base64.b64encode(buffer).decode('utf-8')
 
                         # Put encoded frame in queue for distribution
@@ -254,19 +263,21 @@ class CameraManager:
 
     def _record_event(self, detection_time: float, frame_shape: Tuple[int, int, int]):
         """
-        Retrieves *annotated* frames around the detection time and writes them to a video file,
-        aiming for a duration close to the defined window by limiting frame count.
-        This method is designed to be run in a separate thread via asyncio.to_thread.
+        Retrieves annotated frames and associated detections around the detection time
+        from the buffer, writes them to a video file, and saves metadata to JSON.
+        The JSON detections list only includes frames with detections.
         """
         start_time = detection_time - RECORDING_WINDOW_BEFORE
         end_time = detection_time + RECORDING_WINDOW_AFTER
-        target_duration = RECORDING_WINDOW_BEFORE + RECORDING_WINDOW_AFTER # 30.0 seconds
-        target_frame_count = int(target_duration * self.target_fps) # Calculate target number of frames
+        target_duration = RECORDING_WINDOW_BEFORE + RECORDING_WINDOW_AFTER
+        target_frame_count = int(target_duration * self.target_fps)
 
         # Create unique filename based on detection time
         timestamp_str = datetime.datetime.fromtimestamp(detection_time).strftime("%Y%m%d_%H%M%S_%f")
         video_path = EVENT_DIR / f"event_{timestamp_str}.avi"
+        json_path = EVENT_DIR / f"event_{timestamp_str}.json"
         video_path_str = str(video_path)
+        json_path_str = str(json_path)
 
         # Get frame dimensions (height, width from shape)
         height, width = frame_shape[:2]
@@ -274,53 +285,132 @@ class CameraManager:
             logger.error(f"Invalid frame dimensions for recording: {frame_shape}")
             return
 
-        # Filter frames from the buffer based on time window
-        candidate_frames = []
+        metadata = {
+            "recording_info": {
+                "detection_time": detection_time,
+                "intended_start_time": start_time,
+                "intended_end_time": end_time,
+                "target_fps": self.target_fps,
+                "video_file": video_path.name,
+                "creation_timestamp": time.time(),
+                "creation_datetime": datetime.datetime.now().isoformat()
+            },
+            "detections": [] # Metadata ONLY for frames with detections
+        }
+
+        # --- Edit 4: Retrieve frames and detections from history ---
+        candidate_data = [] # Will store tuples of (frame, timestamp, detections_list)
+
         try:
-            # Create a snapshot for thread safety during iteration
+            # Create a snapshot for thread safety
             history_copy = list(self.frame_history)
-            for frame, timestamp in history_copy: # frame here is now the annotated one
+
+            # No need to sort again if appended chronologically
+            # history_copy.sort(key=lambda x: x[1]) # Optional, if order isn't guaranteed
+
+            # Collect frames, timestamps, and detections in our time window
+            for frame, timestamp, detections_list in history_copy:
                 if start_time <= timestamp <= end_time:
-                    candidate_frames.append(frame)
+                    candidate_data.append((frame, timestamp, detections_list))
+
         except Exception as e:
             logger.error(f"Error accessing frame history: {e}")
             return
 
-        if not candidate_frames:
+        if not candidate_data:
             logger.warning(f"No frames found in buffer for detection time {detection_time:.2f} window [{start_time:.2f} - {end_time:.2f}]")
             return
 
-        # Limit the number of frames to write to match the target duration
-        frames_to_write = candidate_frames[:target_frame_count]
+        # Limit the number of frames based on target_frame_count
+        final_data_to_write = candidate_data[:target_frame_count]
+
+        frames_to_write = []
+        frames_metadata = []      # Holds info for ALL frames being written
+        detections_metadata = []  # Holds info ONLY for frames with detections
+
+        for i, (frame, timestamp, detections_list) in enumerate(final_data_to_write):
+            frames_to_write.append(frame) # Add the annotated frame for video
+            # Always add frame metadata (timestamp, index) for reference
+            frames_metadata.append({
+                "index": i, # Index relative to the frames actually written to video
+                "timestamp": timestamp,
+                "relative_time": timestamp - start_time
+            })
+
+            # --- Edit: Check if detections_list is not empty ---
+            # Only add an entry to detections_metadata if there were detections in this frame
+            if detections_list: # Check if the list is non-empty
+                frame_detections_entry = {
+                    "timestamp": timestamp,
+                    # Optional: Include frame index for easier cross-referencing with the 'frames' list
+                    "frame_index": i,
+                    "objects": [
+                        {
+                            "class_id": class_id,
+                            "label": self.model.labels[class_id],
+                            "confidence": float(score),
+                        }
+                        for score, class_id, _ in detections_list
+                    ]
+                }
+                detections_metadata.append(frame_detections_entry)
+            # --- End Edit ---
+
+        # --- Update metadata with final frame and detection information ---
+        metadata["detections"] = detections_metadata # Contains only frames with detections
+        metadata["recording_info"]["actual_frame_count"] = len(frames_to_write)
+        metadata["recording_info"]["actual_duration"] = len(frames_to_write) / self.target_fps if self.target_fps > 0 else 0
+        metadata["recording_info"]["actual_start_time"] = frames_metadata[0]["timestamp"] if frames_metadata else start_time
+        metadata["recording_info"]["actual_end_time"] = frames_metadata[-1]["timestamp"] if frames_metadata else end_time
+        
+        # Calculate frame rate statistics if we have enough frames
+        if len(frames_metadata) > 1:
+            time_diffs = [frames_metadata[i+1]["timestamp"] - frames_metadata[i]["timestamp"] 
+                        for i in range(len(frames_metadata)-1)]
+            avg_interval = sum(time_diffs) / len(time_diffs)
+            metadata["recording_info"]["avg_frame_interval"] = avg_interval
+            metadata["recording_info"]["calculated_fps"] = 1.0 / avg_interval if avg_interval > 0 else 0
+        
+        # Calculate detection statistics
+        total_detections = sum(len(d["objects"]) for d in detections_metadata)
+        metadata["recording_info"]["total_detections"] = total_detections
+        metadata["recording_info"]["avg_detections_per_detected_frame"] = total_detections / len(detections_metadata) if detections_metadata else 0
+        metadata["recording_info"]["detection_density"] = total_detections / len(frames_to_write) if frames_to_write else 0
+
         actual_frame_count = len(frames_to_write)
         actual_duration = actual_frame_count / self.target_fps if self.target_fps > 0 else 0
 
-        logger.info(f"Selected {actual_frame_count} frames (target: {target_frame_count}) for ~{actual_duration:.2f}s video at {video_path_str} for detection at {detection_time:.2f}")
+        logger.info(f"Selected {actual_frame_count} frames for ~{actual_duration:.2f}s video. Found detections in {len(detections_metadata)} frames.")
 
-        # Create VideoWriter object
+        # Create VideoWriter object using the annotated frames retrieved
         video_writer = None
         try:
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            # Use the actual frame dimensions for the writer
             video_writer = cv2.VideoWriter(video_path_str, fourcc, self.target_fps, (width, height))
 
             if not video_writer.isOpened():
                 logger.error(f"Failed to open video writer at {video_path_str}")
                 return
 
-            # Write the selected frames (these are annotated)
+            # Write the selected frames (which are annotated)
             for frame in frames_to_write:
                 video_writer.write(frame)
 
             logger.info(f"Successfully wrote video: {video_path_str} ({actual_frame_count} frames, ~{actual_duration:.2f}s)")
+            
+            # Save the metadata to JSON file
+            try:
+                with open(json_path_str, 'w') as json_file:
+                    json.dump(metadata, json_file, indent=2)
+                logger.info(f"Successfully wrote metadata to {json_path_str}")
+            except Exception as e:
+                logger.error(f"Error writing metadata file {json_path_str}: {str(e)}")
 
         except Exception as e:
-            logger.exception(f"Error writing video file {video_path_str}: {str(e)}") # Log traceback
+            logger.exception(f"Error writing video file {video_path_str}: {str(e)}")
         finally:
             if video_writer:
                 video_writer.release()
-
-    # --- Methods below remain largely unchanged ---
 
     async def _distribute_frames(self):
         """Distribute frames to all connected clients"""

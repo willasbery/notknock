@@ -2,6 +2,7 @@ import os
 import uvicorn
 import asyncio
 import logging
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +10,8 @@ from starlette.websockets import WebSocketDisconnect
 from contextlib import asynccontextmanager
 
 from CameraManager import CameraManager
+
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -84,6 +87,18 @@ async def status(request: Request):
         "status": "running",
         "camera_running": request.app.state.camera_manager.is_running,
         "connected_clients": len(request.app.state.camera_manager.active_connections)
+    }
+    
+@app.get("/cameras")
+async def cameras(request: Request):
+    return {
+        "cameras": [
+            {
+                "id": os.environ.get("CAMERA_ID"),
+                "name": os.environ.get("CAMERA_NAME"),
+                "location": os.environ.get("CAMERA_LOCATION"),
+            }
+        ]
     }
 
 @app.websocket("/stream")
